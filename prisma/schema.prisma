@@ -1,0 +1,34 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  settlementRef String      @unique // bytes32 hex — links on-chain tx to this record
+  walletAddress String
+  tokenAddress  String
+  amount        String      // USDC amount in wei (BigInt stored as string)
+  fiatCurrency  String
+  fiatAmount    Float
+  rate          Float
+  status        OrderStatus @default(PENDING)
+  txHash        String?     // populated after SwapForwarded event indexed
+  paycrestRef   String?     // Paycrest internal order ref received via webhook
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([walletAddress])
+  @@index([status])
+}
+
+enum OrderStatus {
+  PENDING   // order created, awaiting on-chain tx
+  FORWARDED // SwapForwarded event seen on-chain
+  SETTLED   // Paycrest webhook confirmed fiat payout
+  FAILED    // payout failed
+}
