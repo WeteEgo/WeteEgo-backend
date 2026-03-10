@@ -17,8 +17,12 @@ model Order {
   fiatAmount    Float
   rate          Float
   status        OrderStatus @default(PENDING)
-  txHash        String?     // populated after SwapForwarded event indexed
+  txHash        String?     // populated after SwapForwarded / OrderCreated event indexed
   paycrestRef   String?     // Paycrest internal order ref received via webhook
+  provider      String?    // "paycrest" | "bread" | "own"
+  expiresAt     DateTime    @default(now()) // order valid until createdAt + 10 min
+  bankAccount   String?    // JSON: { accountNumber, bankCode, accountName }
+  version       Int         @default(0) // optimistic lock — increment on every status update
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
@@ -28,7 +32,10 @@ model Order {
 
 enum OrderStatus {
   PENDING   // order created, awaiting on-chain tx
-  FORWARDED // SwapForwarded event seen on-chain
+  FORWARDED // SwapForwarded event seen on-chain (Router path)
+  ESCROWED  // Gateway contract has locked USDC (OrderCreated event)
+  EXPIRED   // order created but no on-chain tx within 10 min
   SETTLED   // Paycrest webhook confirmed fiat payout
+  REFUNDED  // Gateway refund after timeout
   FAILED    // payout failed
 }
