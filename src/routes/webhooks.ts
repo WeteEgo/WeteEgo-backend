@@ -1,6 +1,7 @@
 import { Hono } from "hono"
 import { createHmac, timingSafeEqual } from "crypto"
 import { prisma } from "../lib/prisma.js"
+import { webhookCounter } from "../lib/metrics.js"
 
 const webhooks = new Hono()
 
@@ -13,7 +14,7 @@ async function verifyPaycrestSignature(
   signatureHeader: string | undefined
 ): Promise<boolean> {
   const secret = process.env.PAYCREST_WEBHOOK_SECRET
-  if (!secret) return true // skip verification if secret not configured (dev only)
+  if (!secret) return false // secret is required — startup validation enforces this
   if (!signatureHeader) return false
 
   const expected = `sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`
@@ -44,6 +45,7 @@ webhooks.post("/paycrest", async (c) => {
 
   const valid = await verifyPaycrestSignature(rawBody, signature)
   if (!valid) {
+    webhookCounter.inc({ event: "paycrest", status: "invalid" })
     return c.json({ success: false, error: "Invalid signature" }, 401)
   }
 
@@ -72,6 +74,7 @@ webhooks.post("/paycrest", async (c) => {
     data: { status: newStatus },
   })
 
+  webhookCounter.inc({ event: event ?? "unknown", status: newStatus })
   console.log(`[webhook] Order ${data.settlementRef} → ${newStatus}`)
   return c.json({ success: true })
 })
