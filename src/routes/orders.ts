@@ -3,10 +3,19 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { keccak256, encodePacked } from "viem"
 import { prisma } from "../lib/prisma.js"
+import { orderCounter } from "../lib/metrics.js"
 import { getRate } from "../services/rates.js"
 import { createPaycrestOrder } from "../services/paycrest.js"
 
 const orders = new Hono()
+
+const bankAccountSchema = z
+  .object({
+    accountNumber: z.string(),
+    bankCode: z.string(),
+    accountName: z.string(),
+  })
+  .optional()
 
 const createOrderSchema = z.object({
   walletAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/, "invalid wallet address"),
@@ -15,6 +24,7 @@ const createOrderSchema = z.object({
     message: "amount must be a positive integer string (wei)",
   }),
   fiatCurrency: z.string().min(2).max(5),
+  bankAccount: bankAccountSchema,
 })
 
 /**
@@ -24,7 +34,7 @@ const createOrderSchema = z.object({
  */
 orders.post("/", zValidator("json", createOrderSchema), async (c) => {
   const body = c.req.valid("json")
-  const { walletAddress, tokenAddress, amount, fiatCurrency } = body
+  const { walletAddress, tokenAddress, amount, fiatCurrency, bankAccount } = body
 
   // Generate deterministic bytes32 settlementRef
   const settlementRef = keccak256(
@@ -43,7 +53,7 @@ orders.post("/", zValidator("json", createOrderSchema), async (c) => {
   const rate = await getRate(fiatCurrency)
   const fiatAmount = usdcUnits * rate
 
-  // Persist order
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
   const order = await prisma.order.create({
     data: {
       settlementRef,
@@ -53,10 +63,12 @@ orders.post("/", zValidator("json", createOrderSchema), async (c) => {
       fiatCurrency: fiatCurrency.toUpperCase(),
       fiatAmount,
       rate,
+      expiresAt,
+      bankAccount: bankAccount ? JSON.stringify(bankAccount) : null,
     },
   })
 
-  // Notify Paycrest (fire-and-forget — failure doesn't block the user)
+  // Notify Paycrest async — increment metric only on success/failure
   createPaycrestOrder({
     settlementRef,
     walletAddress,
@@ -65,10 +77,13 @@ orders.post("/", zValidator("json", createOrderSchema), async (c) => {
     fiatCurrency: fiatCurrency.toUpperCase(),
   }).then((paycrestOrder) => {
     if (paycrestOrder) {
+      orderCounter.inc({ status: order.status, provider: "paycrest" })
       prisma.order
         .update({ where: { id: order.id }, data: { paycrestRef: paycrestOrder.id } })
         .catch(() => {})
     }
+  }).catch(() => {
+    orderCounter.inc({ status: "paycrest_submission_failed", provider: "paycrest" })
   })
 
   return c.json(
