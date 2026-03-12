@@ -18,24 +18,128 @@ model Order {
   rate          Float
   status        OrderStatus @default(PENDING)
   txHash        String?     // populated after SwapForwarded / OrderCreated event indexed
-  paycrestRef   String?     // Paycrest internal order ref received via webhook
-  provider      String?    // "paycrest" | "bread" | "own"
+  paycrestRef   String?     // Paycrest internal order ref received via webhook (legacy)
+  provider      String?     // "paycrest"
+  pspProvider    String?     // PSP that settled: "paycrest"
+  pspReference   String?     // PSP-side reference for reconciliation
   expiresAt     DateTime    @default(now()) // order valid until createdAt + 10 min
-  bankAccount   String?    // JSON: { accountNumber, bankCode, accountName }
+  bankAccount   String?     // JSON: { accountNumber, bankCode, accountName }
+  riskScore     Int         @default(0) // AML risk score (0-100+)
   version       Int         @default(0) // optimistic lock — increment on every status update
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
+  paymentAttempts PaymentAttempt[]
+
   @@index([walletAddress])
   @@index([status])
+  @@index([walletAddress, status, createdAt])
+  @@index([status, pspReference, pspProvider])
+}
+
+model PaymentAttempt {
+  id           String   @id @default(cuid())
+  orderId      String
+  order        Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  pspProvider  String
+  pspReference String?
+  status       String   // pending | success | failed
+  amount       String   // NGN or USDC amount as stored by PSP
+  failureReason String?
+  createdAt    DateTime @default(now())
+
+  @@index([orderId])
+  @@index([pspReference])
+}
+
+model BankAccount {
+  id            String   @id @default(cuid())
+  userId        String?  // optional until User model exists
+  accountNumber String
+  bankCode      String
+  bankName      String?
+  accountName   String?
+  verified      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, accountNumber, bankCode])
+  @@index([userId])
+}
+
+model User {
+  id              String    @id @default(cuid())
+  walletAddress   String    @unique
+  kycStatus       String    @default("none")   // none | pending | approved | rejected | manual_review
+  kycProvider     String?   // smileid | dojah
+  kycSessionId    String?
+  kycCompletedAt  DateTime?
+  tier            KycTier   @default(GUEST)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  kycAttempts KYCAttempt[]
+
+  @@index([walletAddress])
+  @@index([kycStatus])
+}
+
+model KYCAttempt {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider  String   // smileid | dojah
+  status    String   // pending | approved | rejected | manual_review
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([provider])
+}
+
+enum KycTier {
+  GUEST  // <= $500/day, wallet only
+  BASIC  // <= $5k/day, BVN verification
+  FULL   // unlimited, full biometric + document
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  entityType  String
+  entityId    String
+  action      String
+  actor       String?
+  previousState String?
+  newState    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model AMLAlert {
+  id           String   @id @default(cuid())
+  walletAddress String
+  ruleTriggered String
+  severity     String   // low | medium | high
+  status       String   @default("open") // open | reviewed | dismissed
+  reviewedBy   String?
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  @@index([walletAddress])
+  @@index([status])
+  @@index([status, createdAt])
 }
 
 enum OrderStatus {
-  PENDING   // order created, awaiting on-chain tx
-  FORWARDED // SwapForwarded event seen on-chain (Router path)
-  ESCROWED  // Gateway contract has locked USDC (OrderCreated event)
-  EXPIRED   // order created but no on-chain tx within 10 min
-  SETTLED   // Paycrest webhook confirmed fiat payout
-  REFUNDED  // Gateway refund after timeout
-  FAILED    // payout failed
+  PENDING        // order created, awaiting on-chain tx
+  FORWARDED      // SwapForwarded event seen on-chain (Router path)
+  ESCROWED       // Gateway contract has locked USDC (OrderCreated event)
+  PAYOUT_SENT    // PSP payout initiated, awaiting confirmation
+  EXPIRED        // order created but no on-chain tx within 10 min
+  SETTLED        // Paycrest webhook confirmed fiat payout
+  REFUNDED       // Gateway refund after timeout
+  FAILED         // payout failed
+  MANUAL_REVIEW  // requires manual intervention (max retries exhausted or mismatch)
 }
