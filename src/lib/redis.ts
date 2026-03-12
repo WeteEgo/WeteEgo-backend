@@ -1,4 +1,4 @@
-import Redis from "ioredis"
+import { Redis } from "ioredis"
 
 let _redis: Redis | null = null
 
@@ -10,7 +10,7 @@ export function getRedis(): Redis {
       enableReadyCheck: true,
       lazyConnect: true,
     })
-    _redis.on("error", (err) => {
+    _redis.on("error", (err: Error) => {
       // Log but don't crash — rate limiting degrades gracefully
       console.error("[redis] connection error", err.message)
     })
