@@ -1,0 +1,4 @@
+replicaCount: 3
+env:
+  NODE_ENV: production
+  CHAIN_ID: "8453"
