@@ -8,7 +8,7 @@ async function checkRateLimit(
   windowSeconds: number,
   c: Context,
   next: Next
-): Promise<Response> {
+): Promise<Response | void> {
   const key = `ratelimit:${scope}:${ip}`
   try {
     const redis = getRedis()
@@ -41,4 +41,9 @@ export function rateLimitRates(c: Context, next: Next) {
 /** 10 requests/min per IP for order creation */
 export function rateLimitOrders(c: Context, next: Next) {
   return checkRateLimit(getClientIP(c), "orders", 10, 60, c, next)
+}
+
+/** 30 requests/min per IP for bank account name resolution */
+export function rateLimitBankVerify(c: Context, next: Next) {
+  return checkRateLimit(getClientIP(c), "bank-verify", 30, 60, c, next)
 }
