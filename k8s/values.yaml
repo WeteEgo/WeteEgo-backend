@@ -1,0 +1,35 @@
+replicaCount: 2
+image:
+  repository: weteego-backend
+  tag: latest
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 3001
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+env: {}
+
+# Secrets: set actual values in values.staging.yaml / values.prod.yaml (never commit real values here)
+# secrets:
+#   DATABASE_URL: ""
+#   PAYCREST_API_KEY: ""
+#   PAYCREST_WEBHOOK_SECRET: ""
+#   REDIS_URL: ""
+#   ADMIN_KEY: ""
+
+serviceMonitor:
+  enabled: false
+  interval: "15s"
+  additionalLabels: {}
