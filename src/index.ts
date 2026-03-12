@@ -1,39 +1,60 @@
 import "dotenv/config"
 
-const required = ["DATABASE_URL", "ROUTER_ADDRESS", "PAYCREST_WEBHOOK_SECRET"]
+const required = ["DATABASE_URL", "PAYCREST_WEBHOOK_SECRET"]
 for (const key of required) {
   if (!process.env[key]) {
     throw new Error(`Missing required env var: ${key}`)
   }
 }
-if (process.env.NODE_ENV === "production" && process.env.CORS_ORIGIN === "*") {
-  throw new Error("CORS_ORIGIN must not be * in production")
+
+// CORS hardening: require explicit origin in production; never allow wildcard
+if (process.env.NODE_ENV === "production") {
+  if (!process.env.CORS_ORIGIN || process.env.CORS_ORIGIN === "*") {
+    throw new Error("CORS_ORIGIN must be explicitly set (not *) in production")
+  }
 }
 
 import { serve } from "@hono/node-server"
 import { Hono } from "hono"
 import { cors } from "hono/cors"
-import { logger } from "hono/logger"
+import { logger as honoLogger } from "hono/logger"
+import { logger } from "./lib/logger.js"
 import { getMetrics } from "./lib/metrics.js"
 import { getRedis } from "./lib/redis.js"
 import { prisma } from "./lib/prisma.js"
 import { startIndexer } from "./services/indexer.js"
+import { checkPaycrestHealth } from "./services/paycrest.js"
 import { startExpireOrdersJob } from "./jobs/expireOrders.js"
-import { rateLimitRates, rateLimitOrders } from "./middleware/rateLimit.js"
+import { startReconciliationWorker } from "./workers/reconciliation.js"
+import { rateLimitRates, rateLimitOrders, rateLimitBankVerify } from "./middleware/rateLimit.js"
+import { idempotencyMiddleware } from "./middleware/idempotency.js"
 import rates from "./routes/rates.js"
 import quotes from "./routes/quotes.js"
 import orders from "./routes/orders.js"
+import bank from "./routes/bank.js"
 import webhooks from "./routes/webhooks.js"
 import admin from "./routes/admin.js"
+import kyc from "./routes/kyc.js"
 
-const app = new Hono()
+type AppVariables = { idempotencyKey?: string }
+const app = new Hono<{ Variables: AppVariables }>()
 
-app.use("*", logger())
+app.use("*", honoLogger())
+
+// CORS: explicit allowed origins, never wildcard in production
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim())
+  : ["*"]
+
 app.use(
   "/api/*",
   cors({
-    origin: process.env.CORS_ORIGIN ?? "*",
+    origin: (origin) => {
+      if (allowedOrigins.includes("*")) return origin ?? "*"
+      return allowedOrigins.includes(origin ?? "") ? origin! : allowedOrigins[0]
+    },
     allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-API-Key"],
   })
 )
 
@@ -46,6 +67,11 @@ app.get("/health", async (c) => {
   return c.json({ db: dbStatus, cache: cacheStatus }, healthy ? 200 : 503)
 })
 
+app.get("/api/health/paycrest", async (c) => {
+  const result = await checkPaycrestHealth()
+  return c.json(result, result.ok ? 200 : 503)
+})
+
 app.get("/metrics", async (c) => {
   const metrics = await getMetrics()
   return c.text(metrics, 200, {
@@ -55,16 +81,19 @@ app.get("/metrics", async (c) => {
 
 app.use("/api/rates/*", rateLimitRates)
 app.use("/api/quotes/*", rateLimitRates)
-app.use("/api/orders", rateLimitOrders)
+app.use("/api/orders", idempotencyMiddleware, rateLimitOrders)
+app.use("/api/bank/*", rateLimitBankVerify)
 app.route("/api/rates", rates)
 app.route("/api/quotes", quotes)
 app.route("/api/orders", orders)
+app.route("/api/bank", bank)
+app.route("/api/kyc", kyc)
 app.route("/api/webhooks", webhooks)
 app.route("/admin", admin)
 
 app.notFound((c) => c.json({ success: false, error: "Not found" }, 404))
 app.onError((err, c) => {
-  console.error("[error]", err)
+  logger.error({ err, path: c.req.path, method: c.req.method }, "Unhandled error")
   return c.json({ success: false, error: "Internal server error" }, 500)
 })
 
@@ -72,7 +101,8 @@ const port = Number(process.env.PORT ?? 3001)
 
 startIndexer()
 startExpireOrdersJob()
+startReconciliationWorker()
 
 serve({ fetch: app.fetch, port }, () => {
-  console.log(`WeteEgo backend running on http://localhost:${port}`)
+  logger.info({ port, env: process.env.NODE_ENV }, "WeteEgo backend started")
 })
