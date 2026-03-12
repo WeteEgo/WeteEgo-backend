@@ -1,0 +1,4 @@
+replicaCount: 1
+env:
+  NODE_ENV: staging
+  CHAIN_ID: "84532"
