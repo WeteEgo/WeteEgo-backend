@@ -1,64 +1,105 @@
 /**
  * On-chain event indexer.
- * Watches WeteEgoRouter for SwapForwarded events using viem's watchContractEvent.
- * Updates order status in DB when a matching settlementRef is found.
+ * Polls for OrderCreated (WeteEgoGateway) or SwapForwarded (WeteEgoRouter) via getLogs.
+ * Uses polling instead of watchContractEvent so it works with public RPCs that don't persist filters.
  */
 
+import { parseAbiItem } from "viem"
 import { publicClient } from "../lib/viem.js"
 import { prisma } from "../lib/prisma.js"
 
-const ROUTER_ABI = [
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: "sender", type: "address" },
-      { indexed: true, name: "token", type: "address" },
-      { indexed: false, name: "amount", type: "uint256" },
-      { indexed: false, name: "settlementRef", type: "bytes32" },
-      { indexed: false, name: "timestamp", type: "uint256" },
-    ],
-    name: "SwapForwarded",
-    type: "event",
-  },
-] as const
+const POLL_INTERVAL_MS = 12_000
+const MAX_RANGE_BLOCKS = 10n
+
+async function markOrderForwarded(settlementRef: `0x${string}`, txHash: `0x${string}`, amount?: string) {
+  await prisma.order.updateMany({
+    where: { settlementRef, status: "PENDING" },
+    data: {
+      status: "FORWARDED",
+      txHash,
+      ...(amount !== undefined && { amount }),
+    },
+  })
+}
+
+function parseSettlementRefFromLog(topics: readonly `0x${string}`[], data: `0x${string}`): `0x${string}` | null {
+  if (data.length >= 66) return data.slice(0, 66) as `0x${string}`
+  return null
+}
 
 export function startIndexer(): void {
+  const gatewayAddress = process.env.GATEWAY_ADDRESS as `0x${string}` | undefined
   const routerAddress = process.env.ROUTER_ADDRESS as `0x${string}` | undefined
-  if (!routerAddress || routerAddress === "0x") {
-    console.warn("[indexer] ROUTER_ADDRESS not set — skipping event indexer")
+
+  const hasGateway = gatewayAddress && gatewayAddress !== "0x"
+  const hasRouter = routerAddress && routerAddress !== "0x"
+
+  if (!hasGateway && !hasRouter) {
+    console.warn("[indexer] GATEWAY_ADDRESS and ROUTER_ADDRESS not set — skipping event indexer")
     return
   }
 
-  console.log("[indexer] Watching SwapForwarded events on", routerAddress)
+  let lastBlock = 0n
 
-  publicClient.watchContractEvent({
-    address: routerAddress,
-    abi: ROUTER_ABI,
-    eventName: "SwapForwarded",
-    onLogs: async (logs) => {
-      for (const log of logs) {
-        const { settlementRef, amount } = log.args
-        const txHash = log.transactionHash
+  const poll = async () => {
+    try {
+      const block = await publicClient.getBlockNumber()
 
-        if (!settlementRef) continue
+      // Respect Alchemy free-tier limit: max 10-block eth_getLogs range
+      const safeFrom = block > MAX_RANGE_BLOCKS ? block - MAX_RANGE_BLOCKS + 1n : 0n
+      const fromBlock = lastBlock === 0n ? safeFrom : lastBlock + 1n
+      const toBlock = block
+      if (fromBlock > toBlock) {
+        setTimeout(poll, POLL_INTERVAL_MS)
+        return
+      }
 
-        try {
-          await prisma.order.updateMany({
-            where: { settlementRef, status: "PENDING" },
-            data: {
-              status: "FORWARDED",
-              txHash,
-              amount: amount?.toString() ?? undefined,
-            },
-          })
-          console.log("[indexer] Order forwarded:", settlementRef, txHash)
-        } catch (err) {
-          console.error("[indexer] Failed to update order:", err)
+      if (hasGateway) {
+        const gatewayLogs = await publicClient.getLogs({
+          address: gatewayAddress!,
+          event: parseAbiItem("event OrderCreated(bytes32 indexed orderId, address indexed sender, address token, uint256 amount, bytes32 settlementRef, uint256 expiresAt)"),
+          fromBlock,
+          toBlock,
+        })
+        for (const log of gatewayLogs) {
+          const settlementRef = log.args.settlementRef ?? parseSettlementRefFromLog(log.topics, log.data)
+          if (!settlementRef) continue
+          try {
+            await markOrderForwarded(settlementRef, log.transactionHash ?? "0x", log.args.amount?.toString())
+            console.log("[indexer] Order forwarded (gateway):", settlementRef, log.transactionHash)
+          } catch (err) {
+            console.error("[indexer] Failed to update order:", err)
+          }
         }
       }
-    },
-    onError: (err) => {
-      console.error("[indexer] Watch error:", err)
-    },
-  })
+
+      if (hasRouter) {
+        const routerLogs = await publicClient.getLogs({
+          address: routerAddress!,
+          event: parseAbiItem("event SwapForwarded(address indexed sender, address indexed token, uint256 amount, bytes32 settlementRef, uint256 timestamp)"),
+          fromBlock,
+          toBlock,
+        })
+        for (const log of routerLogs) {
+          const settlementRef = log.args.settlementRef ?? (log.data.length >= 66 ? (log.data.slice(0, 66) as `0x${string}`) : null)
+          if (!settlementRef) continue
+          try {
+            await markOrderForwarded(settlementRef, log.transactionHash ?? "0x", log.args.amount?.toString())
+            console.log("[indexer] Order forwarded (router):", settlementRef, log.transactionHash)
+          } catch (err) {
+            console.error("[indexer] Failed to update order:", err)
+          }
+        }
+      }
+
+      lastBlock = toBlock
+    } catch (err) {
+      console.error("[indexer] Poll error:", err)
+    }
+    setTimeout(poll, POLL_INTERVAL_MS)
+  }
+
+  if (hasGateway) console.log("[indexer] Polling OrderCreated on gateway", gatewayAddress)
+  if (hasRouter) console.log("[indexer] Polling SwapForwarded on router", routerAddress)
+  poll()
 }
