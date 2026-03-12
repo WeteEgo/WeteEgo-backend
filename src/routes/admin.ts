@@ -119,4 +119,94 @@ admin.get("/stats", async (c) => {
   })
 })
 
+/**
+ * GET /admin/aml/alerts — paginated AML alerts with filters
+ */
+admin.get("/aml/alerts", async (c) => {
+  if (!requireAdmin(c)) {
+    return c.json({ error: "Unauthorized" }, 401)
+  }
+  const status = c.req.query("status")
+  const severity = c.req.query("severity")
+  const limit = Math.min(Number(c.req.query("limit")) || 20, 100)
+  const cursor = c.req.query("cursor")
+
+  const where: { status?: string; severity?: string } = {}
+  if (status) where.status = status
+  if (severity) where.severity = severity
+
+  const alerts = await prisma.aMLAlert.findMany({
+    where,
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    orderBy: { createdAt: "desc" },
+  })
+
+  const nextCursor = alerts.length > limit ? alerts[alerts.length - 1]?.id : null
+  return c.json({ success: true, data: alerts.slice(0, limit), nextCursor })
+})
+
+/**
+ * PATCH /admin/aml/alerts/:id — review or dismiss alert
+ */
+admin.patch("/aml/alerts/:id", async (c) => {
+  if (!requireAdmin(c)) {
+    return c.json({ error: "Unauthorized" }, 401)
+  }
+  const id = c.req.param("id")
+  const body = (await c.req.json().catch(() => ({}))) as { status?: string; notes?: string }
+  const adminKey = c.req.header("x-admin-key") ?? "admin"
+
+  const alert = await prisma.aMLAlert.update({
+    where: { id },
+    data: {
+      status: body.status ?? "reviewed",
+      reviewedBy: adminKey,
+      notes: body.notes ?? undefined,
+    },
+  })
+  return c.json({ success: true, data: alert })
+})
+
+/**
+ * GET /admin/audit-log — searchable audit trail with optional export (CSV via ?format=csv)
+ */
+admin.get("/audit-log", async (c) => {
+  if (!requireAdmin(c)) {
+    return c.json({ error: "Unauthorized" }, 401)
+  }
+  const entityType = c.req.query("entityType")
+  const entityId = c.req.query("entityId")
+  const limit = Math.min(Number(c.req.query("limit")) || 50, 500)
+  const cursor = c.req.query("cursor")
+  const format = c.req.query("format")
+
+  const where: { entityType?: string; entityId?: string } = {}
+  if (entityType) where.entityType = entityType
+  if (entityId) where.entityId = entityId
+
+  const logs = await prisma.auditLog.findMany({
+    where,
+    take: format === "csv" ? 10000 : limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    orderBy: { createdAt: "desc" },
+  })
+
+  if (format === "csv") {
+    const header = "id,entityType,entityId,action,actor,previousState,newState,createdAt\n"
+    const rows = logs
+      .map(
+        (l) =>
+          `${l.id},${l.entityType},${l.entityId},${l.action},${l.actor ?? ""},${(l.previousState ?? "").replace(/,/g, ";")},${(l.newState ?? "").replace(/,/g, ";")},${l.createdAt.toISOString()}`
+      )
+      .join("\n")
+    c.header("Content-Type", "text/csv")
+    c.header("Content-Disposition", "attachment; filename=audit-log.csv")
+    return c.text(header + rows, 200)
+  }
+
+  const nextCursor = logs.length > limit ? logs[limit - 1]?.id : null
+  return c.json({ success: true, data: logs.slice(0, limit), nextCursor })
+})
+
 export default admin
