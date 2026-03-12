@@ -19,18 +19,22 @@ const FALLBACK_RATES: Record<string, number> = {
 }
 
 async function fetchFromPaycrest(): Promise<Record<string, number> | null> {
-  const apiUrl = process.env.PAYCREST_API_URL
   const apiKey = process.env.PAYCREST_API_KEY
-  if (!apiUrl || !apiKey) return null
+  if (!apiKey) return null
 
   try {
-    const res = await fetch(`${apiUrl}/v1/rates`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+    // Paycrest rate endpoint: GET /v1/provider/rates/{token}/{fiat}
+    const res = await fetch("https://api.paycrest.io/v1/provider/rates/USDC/NGN", {
+      headers: { "API-Key": apiKey, "Content-Type": "application/json" },
       signal: AbortSignal.timeout(5000),
     })
     if (!res.ok) return null
-    const data = (await res.json()) as { rates?: Record<string, number> }
-    return data.rates ?? null
+    const json = (await res.json()) as { status?: string; data?: string | number }
+    const rate = json.data
+    if (rate === undefined || rate === null) return null
+    const parsed = typeof rate === "number" ? rate : parseFloat(String(rate))
+    if (isNaN(parsed)) return null
+    return { NGN: parsed }
   } catch {
     return null
   }
