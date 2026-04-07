@@ -1,5 +1,6 @@
 /**
  * PSP orchestrator: Paycrest-only settlement.
+ * Bread Africa fallback dropped for Phase 1 (acquired by SMC DAO 2026-04-06). Dormant until Phase 2 reassessment.
  * Health tracking and circuit breaker still apply for Paycrest resilience.
  */
 
