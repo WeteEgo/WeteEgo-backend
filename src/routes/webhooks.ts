@@ -98,6 +98,10 @@ webhooks.post("/paycrest", async (c) => {
     })
     webhookCounter.inc({ event: event ?? "unknown", status: newStatus })
     console.log(`[webhook] Order ${data.settlementRef} → ${newStatus}`)
+
+    // Push real-time status update so SSE clients see it immediately
+    const redis = getRedis()
+    redis.publish(`order:state:${data.settlementRef}`, JSON.stringify({ status: newStatus })).catch(() => {})
   } catch (err) {
     if (err instanceof InvalidTransitionError) {
       // Order already in terminal state — not an error
