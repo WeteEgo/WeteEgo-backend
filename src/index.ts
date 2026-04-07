@@ -22,7 +22,6 @@ import { logger } from "./lib/logger.js"
 import { getMetrics } from "./lib/metrics.js"
 import { getRedis } from "./lib/redis.js"
 import { prisma } from "./lib/prisma.js"
-import { startIndexer } from "./services/indexer.js"
 import { checkPaycrestHealth } from "./services/paycrest.js"
 import { startExpireOrdersJob } from "./jobs/expireOrders.js"
 import { startReconciliationWorker } from "./workers/reconciliation.js"
@@ -99,7 +98,8 @@ app.onError((err, c) => {
 
 const port = Number(process.env.PORT ?? 3001)
 
-startIndexer()
+// Event indexing and Paycrest payout after escrow are handled by the Go order service
+// (internal/chain/listener.go + statemachine). startIndexer() disabled to avoid duplicate DB updates.
 startExpireOrdersJob()
 startReconciliationWorker()
 
