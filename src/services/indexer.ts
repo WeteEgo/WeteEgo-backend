@@ -8,7 +8,7 @@ import { parseAbiItem } from "viem"
 import { publicClient } from "../lib/viem.js"
 import { prisma } from "../lib/prisma.js"
 
-const POLL_INTERVAL_MS = 12_000
+const POLL_INTERVAL_MS = 3_000
 const MAX_RANGE_BLOCKS = 10n
 
 async function markOrderForwarded(settlementRef: `0x${string}`, txHash: `0x${string}`, amount?: string) {
@@ -45,10 +45,16 @@ export function startIndexer(): void {
     try {
       const block = await publicClient.getBlockNumber()
 
-      // Respect Alchemy free-tier limit: max 10-block eth_getLogs range
-      const safeFrom = block > MAX_RANGE_BLOCKS ? block - MAX_RANGE_BLOCKS + 1n : 0n
-      const fromBlock = lastBlock === 0n ? safeFrom : lastBlock + 1n
-      const toBlock = block
+      // Respect Alchemy free-tier limit: max 10-block eth_getLogs range.
+      // If we ever fall behind (e.g. laptop sleeps), clamp the range so
+      // (toBlock - fromBlock + 1) <= MAX_RANGE_BLOCKS.
+      let toBlock = block
+      let fromBlock = lastBlock === 0n ? (block > MAX_RANGE_BLOCKS ? block - MAX_RANGE_BLOCKS + 1n : 0n) : lastBlock + 1n
+
+      // Clamp fromBlock if we've fallen too far behind or RPC advanced quickly.
+      if (toBlock - fromBlock + 1n > MAX_RANGE_BLOCKS) {
+        fromBlock = toBlock - MAX_RANGE_BLOCKS + 1n
+      }
       if (fromBlock > toBlock) {
         setTimeout(poll, POLL_INTERVAL_MS)
         return
