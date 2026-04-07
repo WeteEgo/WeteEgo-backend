@@ -1,4 +1,28 @@
 replicaCount: 1
+
+image:
+  repository: ghcr.io/weteego/weteego-backend
+  tag: latest
+  pullPolicy: Always
+
 env:
   NODE_ENV: staging
   CHAIN_ID: "84532"
+  GATEWAY_ADDRESS: "0xbe710276c4114c3846a209191a8800049b8ad0a6"
+  RPC_URL: "https://sepolia.base.org"
+  PAYCREST_API_URL: "https://api.paycrest.io/v1"
+  CORS_ORIGIN: "https://staging.weteego.com"
+
+# Real secrets are never committed — injected by provision-staging.sh via kubectl create secret
+# secrets:
+#   DATABASE_URL: ""
+#   REDIS_URL: ""
+#   PAYCREST_API_KEY: ""
+#   PAYCREST_WEBHOOK_SECRET: ""
+#   ADMIN_KEY: ""
+
+serviceMonitor:
+  enabled: true
+  interval: "15s"
+  additionalLabels:
+    release: prometheus
