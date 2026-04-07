@@ -1,12 +1,12 @@
 import { Hono } from "hono"
+import { streamSSE, type SSEStreamingApi } from "hono/streaming"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { keccak256, encodePacked } from "viem"
 import { prisma } from "../lib/prisma.js"
 import { getRedis } from "../lib/redis.js"
-import { orderCounter } from "../lib/metrics.js"
 import { getRate } from "../services/rates.js"
-import { createPayoutWithFailover, verifyBankAccount } from "../services/psp/orchestrator.js"
+import { verifyBankAccount } from "../services/psp/orchestrator.js"
 import { getIdempotencyKey, idempotencyCacheKey, IDEMPOTENCY_TTL_SEC } from "../middleware/idempotency.js"
 import { validateNuban } from "../utils/nuban.js"
 import { checkGuestCheckout, recordGuestVolume } from "../middleware/guestCheckout.js"
@@ -37,9 +37,8 @@ const createOrderSchema = z.object({
 
 /**
  * POST /api/orders
- * Creates an order, generates a settlementRef, and initiates Paycrest payout for NGN.
- * Uses Prisma transaction for atomicity: order + AML alerts + audit log committed together.
- * PSP payout is called after commit (not fire-and-forget — result is tracked).
+ * Creates a PENDING order, generates settlementRef, runs AML/tier checks.
+ * Paycrest payout runs in the Go order service after on-chain OrderCreated (not here).
  * Idempotency-Key header supported for duplicate prevention.
  */
 orders.post("/", zValidator("json", createOrderSchema), async (c) => {
@@ -166,60 +165,6 @@ orders.post("/", zValidator("json", createOrderSchema), async (c) => {
   // Track volume for all tiers (enforces daily + monthly limits)
   recordGuestVolume(walletAddress, orderAmountUsd).catch(() => {})
 
-  // Initiate PSP payout SYNCHRONOUSLY (not fire-and-forget)
-  if (bankAccount && fiatCurrency.toUpperCase() === "NGN") {
-    const idempotencyKey = idemKey ?? `order-${order.id}-${Date.now()}`
-    try {
-      const { result, provider } = await createPayoutWithFailover({
-        orderId: order.id,
-        settlementRef,
-        amountNgn: fiatAmount,
-        amountUsdcUnits: amount,
-        recipient: {
-          accountNumber: bankAccount.accountNumber,
-          bankCode: bankAccount.bankCode,
-          accountName: bankAccount.accountName,
-          currency: fiatCurrency.toUpperCase(),
-        },
-        idempotencyKey,
-      })
-
-      orderCounter.inc({ status: result.status, psp: provider })
-
-      // Record payment attempt
-      await prisma.paymentAttempt.create({
-        data: {
-          orderId: order.id,
-          pspProvider: provider,
-          pspReference: result.pspReference ?? null,
-          status: result.status,
-          amount: String(fiatAmount),
-          failureReason: result.failureReason ?? null,
-        },
-      })
-
-      // Update order with PSP info
-      await prisma.order.update({
-        where: { id: order.id },
-        data: {
-          pspProvider: provider,
-          pspReference: result.pspReference ?? undefined,
-          provider: provider,
-        },
-      })
-
-      if (result.success) {
-        console.log(`[orders] Paycrest payout initiated for ref=${settlementRef}`)
-      } else {
-        console.error(`[orders] Paycrest payout failed for ref=${settlementRef}: ${result.failureReason}`)
-      }
-    } catch (err) {
-      orderCounter.inc({ status: "psp_exception", psp: "paycrest" })
-      console.error("[orders] PSP exception:", err)
-      // Order is still created — reconciliation worker will pick it up
-    }
-  }
-
   const responsePayload = {
     success: true,
     data: {
@@ -248,6 +193,63 @@ orders.post("/", zValidator("json", createOrderSchema), async (c) => {
   }
 
   return c.json(responsePayload, 201)
+})
+
+/**
+ * GET /api/orders/:ref/stream
+ * Server-Sent Events: pushes real-time status updates for an order.
+ * Subscribes to Redis pub/sub channel `order:state:<ref>` and streams events.
+ * Closes automatically when order reaches a terminal state.
+ */
+orders.get("/:ref/stream", async (c) => {
+  const ref = c.req.param("ref")
+  const TERMINAL = new Set(["SETTLED", "FAILED", "REFUNDED"])
+
+  return streamSSE(c, async (stream: SSEStreamingApi) => {
+    const redis = getRedis()
+    const subscriber = redis.duplicate()
+
+    let closed = false
+
+    const cleanup = () => {
+      if (!closed) {
+        closed = true
+        subscriber.unsubscribe(`order:state:${ref}`).catch(() => {})
+        subscriber.disconnect()
+      }
+    }
+
+    stream.onAbort(cleanup)
+
+    await subscriber.subscribe(`order:state:${ref}`)
+    subscriber.on("message", async (_channel: string, message: string) => {
+      if (closed) return
+      try {
+        await stream.writeSSE({ data: message })
+        const parsed = JSON.parse(message) as { status?: string }
+        if (parsed.status && TERMINAL.has(parsed.status)) {
+          cleanup()
+          stream.close()
+        }
+      } catch {
+        // stream already closed
+      }
+    })
+
+    // Heartbeat every 15s to keep connection alive through proxies
+    let heartbeatCount = 0
+    while (!closed) {
+      await stream.sleep(15_000)
+      if (closed) break
+      heartbeatCount++
+      try {
+        await stream.writeSSE({ data: "{}", event: "ping", id: String(heartbeatCount) })
+      } catch {
+        cleanup()
+        break
+      }
+    }
+  })
 })
 
 /**
